@@ -27,7 +27,7 @@ repository. The binaries produced by these scripts (in the release zips) are
 themselves licensed under the terms of their respective upstream projects:
 
 - libimobiledevice, libplist, libusbmuxd, libtatsu, libimobiledevice-glue,
-  usbmuxd, libirecovery, ideviceinstaller, libideviceactivation: LGPL-2.1
+  libirecovery, ideviceinstaller, libideviceactivation: LGPL-2.1
 - libwdi (wdi-simple.exe): LGPL-3.0
 
 Consult each project's repository for the exact license terms. The bundle
