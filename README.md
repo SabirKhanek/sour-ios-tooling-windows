@@ -1,42 +1,73 @@
 # sour-ios-tooling-windows
 
-Self-contained Windows x64 build of the full libimobiledevice ecosystem,
-plus the missing pieces that upstream omits and that jrjr/libimobiledevice-windows
+Self-contained Windows x64 build of libimobiledevice + UxPlay (AirPlay
+receiver), plus the pieces that
+[jrjr/libimobiledevice-windows](https://github.com/jrjr/libimobiledevice-windows)
 doesn't ship.
 
-## Why this exists
+## What's in the zip
 
-[`jrjr/libimobiledevice-windows`](https://github.com/jrjr/libimobiledevice-windows)
-publishes the libimobiledevice client tools (`ideviceinfo`, `idevicebackup2`, etc.).
-That's a fine start — but it omits four things that are required for a Windows
-app to talk to iPhones without depending on iTunes:
+| Tool | What it's for |
+|---|---|
+| `ideviceinfo.exe`, `idevicebackup2.exe`, `idevicepair.exe`, `idevicediagnostics.exe`, `idevicesyslog.exe`, `idevice_id.exe`, `plistutil.exe`, `iproxy.exe`, `afcclient.exe` | Standard libimobiledevice client tools — same set `jrjr` ships, kept current weekly |
+| `ideviceinstaller.exe` | App install / list / uninstall (separate libimobiledevice subproject — jrjr omits this) |
+| `irecovery.exe` | DFU / recovery-mode boot-normal (libirecovery — jrjr omits this) |
+| `ideviceactivation.exe` | Apple-Configurator-style activation (libideviceactivation — jrjr omits this) |
+| `uxplay.exe` + `lib/gstreamer-1.0/*.dll` | AirPlay receiver. iPhones mirror to a window on the host via Screen Mirroring → "UxPlay". GStreamer plugins are bundled and dlopened at runtime |
+| `wdi-simple.exe` | libwdi CLI — binds WinUSB driver to iPhone in DFU mode |
+| All transitive DLLs | `libimobiledevice*.dll`, `libusbmuxd*.dll`, `libplist*.dll`, `libtatsu*.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`, `libcurl*.dll`, `libxml2*.dll`, `libzip*.dll`, GStreamer core libs, SDL2, zlib, etc. |
 
-1. **`usbmuxd.exe`** — the daemon. Every libimobiledevice client (and every
-   pymobiledevice3 invocation) talks to a usbmuxd daemon over a TCP socket
-   on `127.0.0.1:27015`. On Linux/macOS this daemon is installed by the
-   package manager. On Windows, the only daemon listening on that port by
-   default is Apple Mobile Device Service (AMDS), which ships with iTunes.
-   **Shipping our own `usbmuxd.exe` is what removes the iTunes dependency.**
-2. **`ideviceinstaller.exe`** — separate project from libimobiledevice
-   proper. Needed for `apps list / install / uninstall` against iOS devices.
-3. **`irecovery.exe`** — from libirecovery, separate project. Needed for
-   DFU/recovery-mode boot-normal (the "Exit Recovery" feature).
-4. **`ideviceactivation.exe`** — from libideviceactivation, separate
-   project. Apple Configurator-style activation.
+## Important: iTunes is required at runtime
 
-We also ship `wdi-simple.exe` from [`pbatard/libwdi`](https://github.com/pbatard/libwdi)
-so that DFU-mode USB access (which requires the WinUSB driver bound to the
-iPhone in DFU mode) can be set up programmatically without users having to
-run Zadig manually.
+Every tool in this bundle that talks to a USB-connected iPhone (every
+`idevice*.exe`, plus `ideviceinstaller.exe`, plus `irecovery.exe` in
+normal-mode use) is a **usbmuxd client**. On Linux/macOS the matching
+usbmuxd daemon is installed by the OS. **On Windows, the only matching
+daemon is Apple Mobile Device Service (AMDS), which ships with iTunes.**
+
+The upstream libimobiledevice/usbmuxd daemon project is intentionally
+Linux-only — see [libimobiledevice/libusbmuxd#153](https://github.com/libimobiledevice/libusbmuxd/issues/153),
+[#263](https://github.com/libimobiledevice/libusbmuxd/issues/263),
+[#93](https://github.com/libimobiledevice/libusbmuxd/issues/93). We
+cannot replace this without writing a Windows port of usbmuxd from
+scratch (a project nobody has shipped yet).
+
+So users of any app that consumes this bundle **must have iTunes installed
+on their Windows host**. iTunes provides:
+
+- **Apple Mobile Device Support (AMDS)** — listens on `127.0.0.1:27015`,
+  speaks the usbmuxd protocol that every tool here connects to
+- **Bonjour Print Services** — mDNS service discovery, needed for
+  UxPlay's AirPlay receiver to be findable by iPhones over the network
+
+We recommend consumer apps detect these services at startup and surface
+a clear "install iTunes" prompt if missing. (See the example service
+detection in
+[SabirKhanek/sourapp/apps/desktop/src/main/services/appleServicesDetector.ts](https://github.com/SabirKhanek/sourapp).)
+
+## Build pipeline
+
+Built weekly (Sunday 00:00 UTC) and on demand via `workflow_dispatch`.
+
+All upstream sources are pulled fresh from their master branches:
+`libplist`, `libimobiledevice-glue`, `libtatsu`, `libusbmuxd`,
+`libimobiledevice`, `libirecovery`, `ideviceinstaller`,
+`libideviceactivation`, [`FDH2/UxPlay`](https://github.com/FDH2/UxPlay),
+[`pbatard/libwdi`](https://github.com/pbatard/libwdi).
+
+The exact commits used per build land in `VERSIONS.md` inside the zip.
 
 ## Output
 
-Each successful build publishes a release tagged `v<YYYYMMDD>-<git-sha>` with
-one asset:
+Each successful build publishes a release tagged `v<YYYYMMDD>-<git-sha>`
+with one asset:
 
 - `sour-ios-tooling-windows-x64.zip` — flat directory of `.exe` + `.dll`
-  files. Drop the contents anywhere; everything's relative-linked via
-  MinGW64 conventions.
+  files plus a `lib/gstreamer-1.0/` directory for the AirPlay receiver's
+  runtime plugins. Drop the contents anywhere; everything's relative-linked
+  via MinGW64 conventions. **Must keep `lib/gstreamer-1.0/` as a sibling
+  of `uxplay.exe`** — GStreamer resolves plugins relative to its own
+  install prefix.
 
 Plus a `sha256.txt` companion for verification.
 
@@ -45,61 +76,43 @@ Plus a `sha256.txt` companion for verification.
 In your app's binary-fetch pipeline, point at the latest release tag:
 
 ```js
-url: `https://github.com/<OWNER>/sour-ios-tooling-windows/releases/download/${TAG}/sour-ios-tooling-windows-x64.zip`
+url: `https://github.com/SabirKhanek/sour-ios-tooling-windows/releases/download/${TAG}/sour-ios-tooling-windows-x64.zip`
 ```
 
-At runtime, spawn `usbmuxd.exe` as a background process before invoking any
-`idevice*` tool:
+At runtime, your app should:
 
-```ts
-const usbmuxd = spawn(path.join(toolingDir, "usbmuxd.exe"), [], {
-  detached: false,
-  stdio: "ignore",
-});
-process.on("exit", () => usbmuxd.kill());
-```
-
-After that, every libimobiledevice (and pymobiledevice3) call works without
-iTunes / AMDS installed on the host.
-
-## Build schedule
-
-- **Weekly:** Every Sunday 00:00 UTC (matches jrjr's cadence so we track
-  the same upstream cuts).
-- **Manual:** Trigger `Actions → build → Run workflow` to cut a release
-  on demand.
-- **On push:** Pushes to `main` that touch the workflow rebuild.
-
-## Source tracking
-
-All upstream sources are pulled fresh from their respective master branches
-at build time (libplist, libimobiledevice-glue, libtatsu, libusbmuxd,
-libimobiledevice, usbmuxd, libirecovery, ideviceinstaller, libideviceactivation,
-libwdi). The exact commits used for each build land in `VERSIONS.md` inside
-the zip.
-
-If we ever hit a "master broke things" event, swap `git clone --depth=1`
-for `git clone -b vX.Y.Z --depth=1` per repo to pin to releases. None of
-these projects publish prebuilt binaries themselves so master is the
-practical version surface.
+1. **Detect AMDS and Bonjour** at startup (probe `127.0.0.1:27015` and
+   look up the Bonjour service) and surface a banner if missing. Do NOT
+   attempt to spawn a competing daemon — none exists for Windows.
+2. **Spawn `uxplay.exe`** when the user wants AirPlay receiver mode.
+   UxPlay opens its own SDL window for the mirror. Configure it with
+   `-n "<your app name>"` so the iPhone's Screen Mirroring picker shows
+   your branding.
+3. **Run `wdi-simple.exe --vid 0x05ac --pid 0x1227 --type 0`** the first
+   time an iPhone is detected in DFU mode, to bind WinUSB.
 
 ## License notes
 
-This repo is just a build pipeline. Each upstream project carries its own
-license:
+This repo is just a build pipeline. Each upstream project carries its
+own license:
 
 | Project | License |
 |---|---|
-| libimobiledevice / libplist / libusbmuxd / libtatsu / libimobiledevice-glue / usbmuxd / libirecovery / ideviceinstaller / libideviceactivation | LGPL-2.1 |
+| libimobiledevice / libplist / libusbmuxd / libtatsu / libimobiledevice-glue / libirecovery / ideviceinstaller / libideviceactivation | LGPL-2.1 |
 | libwdi | LGPL-3.0 |
+| UxPlay | **GPL-3.0** |
 
-LGPL allows redistribution in commercial closed-source apps provided you
-don't statically link and you include attribution. We dynamically link
-everything; the bundle qualifies. Include a `LICENSES.txt` in your
-distributing app.
+The GPL-3.0 on UxPlay means consumers redistributing the binary must
+**make source available** and **include the GPL-3 text** in their
+LICENSES.txt. We bundle UxPlay as a subprocess (mere aggregation, not
+derivative work); this is the same model GCC / ImageMagick consumers
+use under GPL. LGPL components allow dynamic-linking redistribution
+in closed-source apps with attribution.
+
+Consult each project's repository for the exact license terms.
 
 ## Smoke test runs as part of every build
 
-Before publishing the release, the CI invokes `--help` on each binary to
-catch DLL-link failures. A build with a broken binary fails CI rather than
-shipping a half-bundle.
+Before publishing the release, the CI invokes `--help` on each binary
+(including `uxplay.exe`) to catch DLL-link failures. A build with a
+broken binary fails CI rather than shipping a half-bundle.

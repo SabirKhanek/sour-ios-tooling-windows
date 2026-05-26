@@ -71,6 +71,15 @@ jobs:
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-python
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-gstreamer
+            mingw-w64-x86_64-gst-plugins-base
+            mingw-w64-x86_64-gst-plugins-good
+            mingw-w64-x86_64-gst-plugins-bad
+            mingw-w64-x86_64-gst-plugins-ugly
+            mingw-w64-x86_64-gst-libav
+            mingw-w64-x86_64-gst-rtsp-server
 
       - name: Print toolchain versions
         shell: msys2 {0}
@@ -89,10 +98,14 @@ jobs:
       # than pinning, because libimobiledevice patches USB/Apple protocol
       # changes fast and the version pins on these projects drift.
       #
-      # If we hit reproducibility issues later, swap `git clone` for
-      # `git clone -b vX.Y.Z` per repo. Versions per build are captured in
-      # the VERSIONS.md artifact below.
-      - name: Build libimobiledevice + usbmuxd stack
+      # Important: the `usbmuxd` DAEMON is intentionally Linux-only upstream.
+      # libimobiledevice maintainers have stated this explicitly
+      # (libimobiledevice/libusbmuxd#153, #263, #93). On Windows we cannot
+      # build it — and that's fine: Apple Mobile Device Service (from iTunes)
+      # already listens on 127.0.0.1:27015 and speaks the same protocol.
+      # Consumers of this zip must therefore have iTunes installed; this
+      # README and the bundled SETUP.md document that requirement.
+      - name: Build libimobiledevice client stack
         shell: msys2 {0}
         run: |
           set -euxo pipefail
@@ -104,14 +117,14 @@ jobs:
           export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
 
           # Source-build order matters — each repo's autogen.sh runs
-          # pkg-config against the previously-installed libs.
+          # pkg-config against the previously-installed libs. NOTE: no
+          # `usbmuxd` daemon entry — that project is Linux-only upstream.
           REPOS=(
             libplist                # base plist serialization
             libimobiledevice-glue   # shared utility lib (collections, threads, sockets)
             libtatsu                # Apple Tatsu (TSS) request/response — needed for backup encryption & restore
-            libusbmuxd              # CLIENT library — every tool below links against this
+            libusbmuxd              # CLIENT library — every tool below links against this and talks to AMDS on 127.0.0.1:27015
             libimobiledevice        # the idevice* tools + libimobiledevice.dll
-            usbmuxd                 # THE DAEMON. critical. without this, jrjr's tools need iTunes.
             libirecovery            # irecovery tool — DFU/recovery boot-normal
             ideviceinstaller        # app install / uninstall / list (separate from libimobiledevice proper)
             libideviceactivation    # ideviceactivation — Apple Configurator-style activation
@@ -127,6 +140,48 @@ jobs:
             popd > /dev/null
             echo "::endgroup::"
           done
+
+      # ── Phase 1b: UxPlay (AirPlay receiver) + GStreamer runtime ─────────
+      #
+      # UxPlay is the open-source AirPlay receiver — what makes iPhones able
+      # to AirPlay-mirror to our app. FDH2 publishes only source (no
+      # prebuilts), so we compile from source via MSYS2 / CMake.
+      #
+      # GStreamer is UxPlay's media backend (decoding H.264 video + ALAC
+      # audio from the AirPlay stream). All the gst-plugins-* packages we
+      # pacman-installed above are needed at runtime too — they're loaded
+      # dynamically at uxplay startup and we copy them into the release zip.
+      #
+      # License: GPL-3.0. We bundle UxPlay as a subprocess (mere aggregation,
+      # not derivative work). LICENSES.txt inside the zip carries the GPL
+      # text and source-availability notice pointing at FDH2/UxPlay.
+      - name: Build UxPlay (AirPlay receiver)
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          PREFIX=/mingw64
+
+          git clone --depth=1 https://github.com/FDH2/UxPlay.git
+          pushd UxPlay > /dev/null
+          mkdir build
+          pushd build > /dev/null
+          # MSYS Makefiles generator is the most reliable on the runner;
+          # Ninja is faster but tends to flake on the GitHub Windows image.
+          cmake .. \
+            -G "MSYS Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX
+          make -j$(nproc)
+          make install
+          popd > /dev/null
+          popd > /dev/null
+
+          # Sanity check — uxplay must accept --help without DLL errors.
+          $PREFIX/bin/uxplay.exe --help > /dev/null 2>&1 || {
+            out=$($PREFIX/bin/uxplay.exe --help 2>&1 || true)
+            [ -n "$out" ] || { echo "uxplay produced no output — likely missing GStreamer DLLs"; exit 1; }
+          }
+          echo "✓ uxplay.exe smoke test passed"
 
       # ── Phase 2: libwdi (WinUSB driver installer for DFU mode) ──────────
       #
@@ -180,6 +235,7 @@ jobs:
             ideviceinstaller
             irecovery
             ideviceactivation
+            uxplay
           )
 
           for t in "${TOOLS[@]}"; do
@@ -196,12 +252,6 @@ jobs:
               echo "  ok ($t prints help and exits — fine)"
             }
           done
-
-          # usbmuxd is a daemon — `--help` exits 0 but `--version` is the
-          # cleanest no-device test.
-          $PREFIX/bin/usbmuxd.exe --help > /dev/null 2>&1 || true
-          ls -la $PREFIX/bin/usbmuxd.exe
-          echo "✓ usbmuxd.exe exists"
 
       # ── Phase 4: Collect everything into a flat output dir ─────────────
       #
@@ -222,7 +272,7 @@ jobs:
             -name "irecovery.exe" -o \
             -name "ideviceinstaller.exe" -o \
             -name "ideviceactivation.exe" -o \
-            -name "usbmuxd.exe" -o \
+            -name "uxplay.exe" -o \
             -name "plistutil.exe" -o \
             -name "iproxy.exe" -o \
             -name "inetcat.exe" -o \
@@ -249,8 +299,40 @@ jobs:
             -name "libidn*.dll" -o \
             -name "libnghttp*.dll" -o \
             -name "libpsl*.dll" -o \
-            -name "libzstd*.dll" \
+            -name "libzstd*.dll" -o \
+            -name "SDL2.dll" -o \
+            -name "libgstreamer-1.0-0.dll" -o \
+            -name "libgst*.dll" -o \
+            -name "libglib-2.0-0.dll" -o \
+            -name "libgmodule-2.0-0.dll" -o \
+            -name "libgobject-2.0-0.dll" -o \
+            -name "libgio-2.0-0.dll" -o \
+            -name "libffi-*.dll" -o \
+            -name "libpcre*.dll" -o \
+            -name "libwinpthread-1.dll" -o \
+            -name "libgcc_s_seh-1.dll" -o \
+            -name "libstdc++-6.dll" -o \
+            -name "libx264-*.dll" -o \
+            -name "libavcodec-*.dll" -o \
+            -name "libavformat-*.dll" -o \
+            -name "libavutil-*.dll" -o \
+            -name "libavfilter-*.dll" -o \
+            -name "libswscale-*.dll" -o \
+            -name "libswresample-*.dll" \
           \) -exec cp -v {} out/ \;
+
+          # GStreamer plugin directory must come along whole — UxPlay
+          # dlopens these at runtime via `gst_plugin_load_file`. Without
+          # them, AirPlay receiver silently fails to negotiate the H.264
+          # pipeline. Plugins live in $PREFIX/lib/gstreamer-1.0/.
+          if [ -d "$PREFIX/lib/gstreamer-1.0" ]; then
+            mkdir -p out/lib/gstreamer-1.0
+            cp -rv $PREFIX/lib/gstreamer-1.0/*.dll out/lib/gstreamer-1.0/ || true
+            echo "✓ Copied GStreamer plugins ($(ls out/lib/gstreamer-1.0/ | wc -l) files)"
+          else
+            echo "✗ Missing $PREFIX/lib/gstreamer-1.0 — gstreamer pacman install failed?"
+            exit 1
+          fi
 
           # libwdi's CLI binary lives outside /mingw64/bin since we built
           # it as static + the example tool is in the project tree.
@@ -261,10 +343,11 @@ jobs:
           fi
 
           # Sanity check — count what we produced. Bail early if absurdly
-          # low (catches misconfigured globs).
-          count=$(ls out/ | wc -l)
+          # low (catches misconfigured globs). GStreamer + UxPlay push the
+          # expected file count well above the previous ~20 threshold.
+          count=$(find out/ -type f | wc -l)
           echo "Collected $count files"
-          if [ "$count" -lt 20 ]; then
+          if [ "$count" -lt 50 ]; then
             echo "✗ Suspiciously few files — build is probably broken"
             ls -la out/
             exit 1
@@ -282,7 +365,7 @@ jobs:
             echo
             echo "## Upstream commits"
             echo
-            for repo in libplist libimobiledevice-glue libtatsu libusbmuxd libimobiledevice usbmuxd libirecovery ideviceinstaller libideviceactivation libwdi; do
+            for repo in libplist libimobiledevice-glue libtatsu libusbmuxd libimobiledevice libirecovery ideviceinstaller libideviceactivation UxPlay libwdi; do
               if [ -d "$repo/.git" ]; then
                 sha=$(git -C "$repo" rev-parse --short HEAD)
                 echo "- \`$repo\`: $sha"
@@ -304,31 +387,44 @@ jobs:
           Sour iOS Tooling for Windows x64
           ================================
 
-          This zip contains a complete iOS-tooling stack for Windows that does NOT
-          require iTunes / Apple Mobile Device Support installed on the host.
+          REQUIREMENT: iTunes must be installed on the host.
+          ---------------------------------------------------
+          Every libimobiledevice client tool in this bundle talks to Apple
+          Mobile Device Service (AMDS) on 127.0.0.1:27015 — AMDS ships with
+          iTunes. There is no Windows port of the usbmuxd daemon (this is
+          intentionally Linux-only upstream — see
+          libimobiledevice/libusbmuxd#153). UxPlay's AirPlay receiver also
+          relies on Bonjour Print Services for mDNS, which iTunes installs.
 
           Contents:
-            usbmuxd.exe            — the daemon. Must be running for any idevice* tool
-                                     to communicate with a connected iPhone. Listens
-                                     on 127.0.0.1:27015 — same protocol AMDS/iTunes
-                                     uses, so consumers don't need to know which is
-                                     running.
             ideviceinfo.exe, idevicebackup2.exe, idevicepair.exe,
             idevicediagnostics.exe, idevicesyslog.exe, idevice_id.exe,
-            ideviceinstaller.exe   — standard libimobiledevice clients
-            irecovery.exe          — DFU/recovery mode boot-normal
-            ideviceactivation.exe  — Apple Configurator-style activation
+            plistutil.exe, iproxy.exe, afcclient.exe
+                                   — standard libimobiledevice clients
+            ideviceinstaller.exe   — app install / list / uninstall
+            irecovery.exe          — DFU/recovery boot-normal
+            ideviceactivation.exe  — Apple-Configurator-style activation
+            uxplay.exe             — AirPlay receiver (iPhone → Screen Mirroring → host)
+            lib/gstreamer-1.0/     — GStreamer plugins UxPlay loads at runtime.
+                                     Must remain a sibling of uxplay.exe.
             wdi-simple.exe         — libwdi CLI; binds WinUSB to iPhone in DFU mode
 
           Usage:
-            1. Extract this zip.
-            2. Start usbmuxd.exe as a background process (or as a Windows service).
-            3. All idevice* tools will now connect through it to attached iPhones.
-            4. For DFU mode operations, first run:
+            1. Extract this zip; keep `lib/gstreamer-1.0/` next to `uxplay.exe`.
+            2. Ensure iTunes is installed and "Apple Mobile Device Service"
+               is running (Services.msc).
+            3. All idevice* tools connect through AMDS to attached iPhones.
+            4. To start an AirPlay receiver:
+                 uxplay.exe -n "Your Device Name"
+               iPhone Control Center → Screen Mirroring should now show
+               "Your Device Name" as a destination.
+            5. For DFU-mode operations, first run:
                  wdi-simple.exe --vid 0x05ac --pid 0x1227 --type 0
                (driver type 0 = WinUSB)
 
-          See https://github.com/<OWNER>/<REPO> for build instructions and license info.
+          See https://github.com/SabirKhanek/sour-ios-tooling-windows for
+          build instructions, license attribution (LGPL + GPL-3.0 for UxPlay),
+          and source availability info.
           EOF
 
       # ── Phase 5: Package + publish release ──────────────────────────────
