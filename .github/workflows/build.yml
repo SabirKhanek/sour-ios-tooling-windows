@@ -139,18 +139,59 @@ jobs:
       # mode present a different USB VID/PID than normal mode; even if iTunes
       # is installed, DFU communication requires WinUSB driver binding.
       #
-      # libwdi compiles cleanly under MSYS2/MinGW64 with autotools. We ship
-      # both the lib and the `wdi-simple.exe` CLI so callers can invoke it
-      # directly to bind WinUSB to e.g. VID 0x05ac PID 0x1227 (iPhone DFU).
+      # libwdi compiles cleanly under MSYS2/MinGW64 with autotools, BUT its
+      # configure script requires the Windows Driver Kit (WDK) — specifically
+      # the WinUSB co-installer DLLs (WinUsbCoInstaller2.dll) and WDF
+      # co-installer DLLs (WdfCoInstaller01011.dll). These are not part of
+      # the standard GitHub Actions Windows runner image.
+      #
+      # We install Windows Driver Kit 8.1 via chocolatey (preinstalled on the
+      # runner) before building libwdi, then point autogen.sh at the WDK
+      # install via --with-wdkdir. WDK 8.1's redist DLLs satisfy libwdi's
+      # WinUSB/WDF requirements; libwdi handles the version-detection.
+
+      - name: Install Windows Driver Kit 8.1 (for libwdi)
+        shell: pwsh
+        run: |
+          # Chocolatey is preinstalled on windows-latest runners. The
+          # `windowsdriverkit81` package ships the WinUSB + WDF redist DLLs
+          # libwdi's configure looks for. The install is ~250 MB and
+          # takes ~2 min.
+          choco install windowsdriverkit81 -y --no-progress
+
+          # Verify the redist DLLs landed where libwdi expects them.
+          $wdkRedist = "C:\Program Files (x86)\Windows Kits\8.1\redist"
+          if (-not (Test-Path "$wdkRedist\winusb")) {
+            Write-Error "WDK 8.1 install completed but $wdkRedist\winusb is missing. Investigate before proceeding."
+            exit 1
+          }
+          if (-not (Test-Path "$wdkRedist\wdf")) {
+            Write-Error "WDK 8.1 install completed but $wdkRedist\wdf is missing."
+            exit 1
+          }
+          Write-Host "✓ WDK 8.1 redistributables ready at $wdkRedist"
+
       - name: Build libwdi (WinUSB driver setup for DFU)
         shell: msys2 {0}
         run: |
           set -euxo pipefail
           PREFIX=/mingw64
 
+          # Translate the Windows-style WDK path to MSYS2-style so libwdi's
+          # autoconf-based configure can grok it.
+          WDK_DIR="/c/Program Files (x86)/Windows Kits/8.1"
+          if [ ! -d "$WDK_DIR/redist/winusb" ]; then
+            echo "✗ WDK 8.1 not found at $WDK_DIR — chocolatey install step must run first"
+            exit 1
+          fi
+
           git clone --depth=1 https://github.com/pbatard/libwdi.git
           pushd libwdi > /dev/null
-          ./autogen.sh --prefix=$PREFIX --enable-static --disable-shared
+          ./autogen.sh \
+            --prefix=$PREFIX \
+            --enable-static \
+            --disable-shared \
+            --with-wdkdir="$WDK_DIR"
           make -j$(nproc)
           make install
           # `wdi-simple` is the example CLI that ships with libwdi.
