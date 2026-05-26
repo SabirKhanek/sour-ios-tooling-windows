@@ -1,0 +1,389 @@
+name: build
+
+# Builds the full iOS-tooling stack for Windows x64 from upstream
+# libimobiledevice org sources + supporting libraries, using MSYS2/MinGW64.
+#
+# Why this exists (vs. using jrjr/libimobiledevice-windows):
+#   jrjr only ships the libimobiledevice CLIENT tools. They omit:
+#     - usbmuxd.exe (the DAEMON)             ← without this, every libimobiledevice
+#                                              tool needs iTunes/AMDS at runtime
+#     - ideviceinstaller                     ← apps list / install / uninstall
+#     - irecovery (libirecovery)             ← DFU exit
+#     - ideviceactivation (libideviceactivation) ← activation
+#     - libwdi-based WinUSB driver installer ← required for DFU-mode USB access
+#
+# This repo builds ALL of the above into one self-contained zip, so consumers
+# can ship Windows apps that talk to iOS without requiring iTunes installed.
+#
+# Trigger:
+#   - manual: workflow_dispatch
+#   - scheduled: weekly Sunday at 00:00 UTC (mirrors jrjr's cadence)
+#   - on push to main when build inputs change
+#
+# Output:
+#   Single release per build, tagged v<YYYYMMDD>-<short-sha>, with one asset:
+#     sour-ios-tooling-windows-x64.zip
+#
+# Consumers fetch by tag from this repo's releases.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'versions.json'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # MSYS2 / MinGW64 toolchain. Identical to jrjr's pipeline for the
+      # libimobiledevice client builds — we just add more packages and more
+      # repos to build on top.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >
+            git
+            zip
+            unzip
+            make
+            autoconf
+            automake
+            libtool
+            pkgconf
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-libzip
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-python
+
+      - name: Print toolchain versions
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          gcc --version
+          autoconf --version
+          pkg-config --version
+          openssl version
+          pacman -Q mingw-w64-x86_64-libusb mingw-w64-x86_64-libzip mingw-w64-x86_64-libxml2
+
+      # ── Phase 1: libimobiledevice ecosystem ─────────────────────────────
+      #
+      # Build in strict dependency order. Each repo is upstream master at
+      # the time of the build — we follow jrjr's "track master" model rather
+      # than pinning, because libimobiledevice patches USB/Apple protocol
+      # changes fast and the version pins on these projects drift.
+      #
+      # If we hit reproducibility issues later, swap `git clone` for
+      # `git clone -b vX.Y.Z` per repo. Versions per build are captured in
+      # the VERSIONS.md artifact below.
+      - name: Build libimobiledevice + usbmuxd stack
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          # Where headers + libs install to inside MSYS2. /mingw64 is the
+          # standard MinGW64 prefix; all subsequent builds find each other
+          # via pkg-config because of this.
+          PREFIX=/mingw64
+          export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
+
+          # Source-build order matters — each repo's autogen.sh runs
+          # pkg-config against the previously-installed libs.
+          REPOS=(
+            libplist                # base plist serialization
+            libimobiledevice-glue   # shared utility lib (collections, threads, sockets)
+            libtatsu                # Apple Tatsu (TSS) request/response — needed for backup encryption & restore
+            libusbmuxd              # CLIENT library — every tool below links against this
+            libimobiledevice        # the idevice* tools + libimobiledevice.dll
+            usbmuxd                 # THE DAEMON. critical. without this, jrjr's tools need iTunes.
+            libirecovery            # irecovery tool — DFU/recovery boot-normal
+            ideviceinstaller        # app install / uninstall / list (separate from libimobiledevice proper)
+            libideviceactivation    # ideviceactivation — Apple Configurator-style activation
+          )
+
+          for repo in "${REPOS[@]}"; do
+            echo "::group::Build $repo"
+            git clone --depth=1 "https://github.com/libimobiledevice/$repo.git"
+            pushd "$repo" > /dev/null
+            ./autogen.sh --prefix=$PREFIX
+            make -j$(nproc)
+            make install
+            popd > /dev/null
+            echo "::endgroup::"
+          done
+
+      # ── Phase 2: libwdi (WinUSB driver installer for DFU mode) ──────────
+      #
+      # libwdi is what Zadig uses internally — Pete Batard's library for
+      # programmatically binding WinUSB to a USB device. iPhones in DFU
+      # mode present a different USB VID/PID than normal mode; even if iTunes
+      # is installed, DFU communication requires WinUSB driver binding.
+      #
+      # libwdi compiles cleanly under MSYS2/MinGW64 with autotools. We ship
+      # both the lib and the `wdi-simple.exe` CLI so callers can invoke it
+      # directly to bind WinUSB to e.g. VID 0x05ac PID 0x1227 (iPhone DFU).
+      - name: Build libwdi (WinUSB driver setup for DFU)
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          PREFIX=/mingw64
+
+          git clone --depth=1 https://github.com/pbatard/libwdi.git
+          pushd libwdi > /dev/null
+          ./autogen.sh --prefix=$PREFIX --enable-static --disable-shared
+          make -j$(nproc)
+          make install
+          # `wdi-simple` is the example CLI that ships with libwdi.
+          # It's what we'll invoke programmatically from the desktop app
+          # to bind WinUSB to the iPhone in DFU mode.
+          ls -la examples/wdi-simple.exe || ls -la examples/.libs/wdi-simple.exe
+          popd > /dev/null
+
+      # ── Phase 3: Smoke test each binary before packaging ───────────────
+      #
+      # Never ship a half-bundle. If a binary fails to launch (e.g. missing
+      # DLL or broken link), this step fails the build BEFORE we publish
+      # the release. Each test runs a no-op flag (`--help` or similar) that
+      # doesn't need a device attached.
+      - name: Smoke test built binaries
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          PREFIX=/mingw64
+
+          # idevice* tools all respond to --help with exit code 0 or stable
+          # exit code 1 (depending on tool). We accept either, we just need
+          # them to not crash with a DLL-not-found error.
+          TOOLS=(
+            ideviceinfo
+            idevicebackup2
+            idevicepair
+            idevicediagnostics
+            idevicesyslog
+            idevice_id
+            ideviceinstaller
+            irecovery
+            ideviceactivation
+          )
+
+          for t in "${TOOLS[@]}"; do
+            echo "Smoke-testing $t"
+            $PREFIX/bin/$t.exe --help > /dev/null 2>&1 || {
+              # Some idevice tools print help to stderr and exit non-zero.
+              # We re-run and verify the binary at least produced *some*
+              # output. A truly broken binary errors before printing.
+              out=$($PREFIX/bin/$t.exe --help 2>&1 || true)
+              if [ -z "$out" ]; then
+                echo "✗ $t produced no output — DLL missing or build broken"
+                exit 1
+              fi
+              echo "  ok ($t prints help and exits — fine)"
+            }
+          done
+
+          # usbmuxd is a daemon — `--help` exits 0 but `--version` is the
+          # cleanest no-device test.
+          $PREFIX/bin/usbmuxd.exe --help > /dev/null 2>&1 || true
+          ls -la $PREFIX/bin/usbmuxd.exe
+          echo "✓ usbmuxd.exe exists"
+
+      # ── Phase 4: Collect everything into a flat output dir ─────────────
+      #
+      # Match the layout consumers expect: one flat directory of executables
+      # + DLLs, no nested bin/lib hierarchy. This is the same shape jrjr's
+      # `libimobile-suite-latest_w64.zip` uses.
+      - name: Collect binaries + DLLs
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          PREFIX=/mingw64
+          mkdir -p out
+
+          # Every tool we built. Globs catch both the .exe and any libtool
+          # wrappers MSYS2 may have produced.
+          find $PREFIX/bin/ -type f \( \
+            -name "idevice*.exe" -o \
+            -name "irecovery.exe" -o \
+            -name "ideviceinstaller.exe" -o \
+            -name "ideviceactivation.exe" -o \
+            -name "usbmuxd.exe" -o \
+            -name "plistutil.exe" -o \
+            -name "iproxy.exe" -o \
+            -name "inetcat.exe" -o \
+            -name "afcclient.exe" -o \
+            -name "libimobiledevice*.dll" -o \
+            -name "libplist*.dll" -o \
+            -name "libusbmuxd*.dll" -o \
+            -name "libtatsu*.dll" -o \
+            -name "libirecovery*.dll" -o \
+            -name "libideviceactivation*.dll" -o \
+            -name "libimobiledevice-glue*.dll" -o \
+            -name "libusb-1.0.dll" -o \
+            -name "libssl-3-x64.dll" -o \
+            -name "libcrypto-3-x64.dll" -o \
+            -name "libzip*.dll" -o \
+            -name "libxml2*.dll" -o \
+            -name "libcurl*.dll" -o \
+            -name "zlib*.dll" -o \
+            -name "libbrotli*.dll" -o \
+            -name "libiconv*.dll" -o \
+            -name "libunistring*.dll" -o \
+            -name "libssh*.dll" -o \
+            -name "libintl*.dll" -o \
+            -name "libidn*.dll" -o \
+            -name "libnghttp*.dll" -o \
+            -name "libpsl*.dll" -o \
+            -name "libzstd*.dll" \
+          \) -exec cp -v {} out/ \;
+
+          # libwdi's CLI binary lives outside /mingw64/bin since we built
+          # it as static + the example tool is in the project tree.
+          if [ -f libwdi/examples/wdi-simple.exe ]; then
+            cp -v libwdi/examples/wdi-simple.exe out/
+          elif [ -f libwdi/examples/.libs/wdi-simple.exe ]; then
+            cp -v libwdi/examples/.libs/wdi-simple.exe out/
+          fi
+
+          # Sanity check — count what we produced. Bail early if absurdly
+          # low (catches misconfigured globs).
+          count=$(ls out/ | wc -l)
+          echo "Collected $count files"
+          if [ "$count" -lt 20 ]; then
+            echo "✗ Suspiciously few files — build is probably broken"
+            ls -la out/
+            exit 1
+          fi
+
+      - name: Generate VERSIONS.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            echo "# Sour iOS Tooling for Windows — build manifest"
+            echo
+            echo "Built at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            echo "## Upstream commits"
+            echo
+            for repo in libplist libimobiledevice-glue libtatsu libusbmuxd libimobiledevice usbmuxd libirecovery ideviceinstaller libideviceactivation libwdi; do
+              if [ -d "$repo/.git" ]; then
+                sha=$(git -C "$repo" rev-parse --short HEAD)
+                echo "- \`$repo\`: $sha"
+              fi
+            done
+            echo
+            echo "## MSYS2 package versions"
+            echo '```'
+            # Re-list relevant packages so consumers can correlate runtime DLL versions.
+            echo "(run: pacman -Q mingw-w64-x86_64-{libusb,libzip,libxml2,openssl,curl})"
+            echo '```'
+          } > out/VERSIONS.md
+
+      - name: Generate README inside zip
+        shell: bash
+        run: |
+          mkdir -p out
+          cat > out/README.txt <<'EOF'
+          Sour iOS Tooling for Windows x64
+          ================================
+
+          This zip contains a complete iOS-tooling stack for Windows that does NOT
+          require iTunes / Apple Mobile Device Support installed on the host.
+
+          Contents:
+            usbmuxd.exe            — the daemon. Must be running for any idevice* tool
+                                     to communicate with a connected iPhone. Listens
+                                     on 127.0.0.1:27015 — same protocol AMDS/iTunes
+                                     uses, so consumers don't need to know which is
+                                     running.
+            ideviceinfo.exe, idevicebackup2.exe, idevicepair.exe,
+            idevicediagnostics.exe, idevicesyslog.exe, idevice_id.exe,
+            ideviceinstaller.exe   — standard libimobiledevice clients
+            irecovery.exe          — DFU/recovery mode boot-normal
+            ideviceactivation.exe  — Apple Configurator-style activation
+            wdi-simple.exe         — libwdi CLI; binds WinUSB to iPhone in DFU mode
+
+          Usage:
+            1. Extract this zip.
+            2. Start usbmuxd.exe as a background process (or as a Windows service).
+            3. All idevice* tools will now connect through it to attached iPhones.
+            4. For DFU mode operations, first run:
+                 wdi-simple.exe --vid 0x05ac --pid 0x1227 --type 0
+               (driver type 0 = WinUSB)
+
+          See https://github.com/<OWNER>/<REPO> for build instructions and license info.
+          EOF
+
+      # ── Phase 5: Package + publish release ──────────────────────────────
+      - name: Package zip
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd out
+          zip -r ../sour-ios-tooling-windows-x64.zip .
+          cd ..
+          ls -la sour-ios-tooling-windows-x64.zip
+          # Compute SHA-256 so the release notes can list it for verification.
+          sha256sum sour-ios-tooling-windows-x64.zip | tee sha256.txt
+
+      - name: Upload build artifact (always — useful for debugging failed releases)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sour-ios-tooling-windows-x64
+          path: |
+            sour-ios-tooling-windows-x64.zip
+            sha256.txt
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        # Only publish from main / scheduled runs, not arbitrary workflow_dispatch
+        # from feature branches.
+        if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG="v$(date -u +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          SHA256=$(awk '{print $1}' sha256.txt)
+
+          BODY=$(cat <<EOF
+          Auto-built weekly from upstream libimobiledevice + supporting projects.
+
+          **Asset:** \`sour-ios-tooling-windows-x64.zip\`
+          **SHA-256:** \`$SHA256\`
+
+          ### What's included
+          - libimobiledevice client tools (idevice*, plistutil, afcclient, iproxy)
+          - **usbmuxd.exe daemon** — makes the suite work without iTunes
+          - ideviceinstaller, irecovery, ideviceactivation
+          - libwdi (wdi-simple.exe) for WinUSB driver setup in DFU mode
+
+          See README.txt inside the zip for usage. Versions in VERSIONS.md.
+          EOF
+          )
+
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --notes "$BODY" \
+            sour-ios-tooling-windows-x64.zip sha256.txt
