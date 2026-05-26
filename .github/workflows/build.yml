@@ -32,9 +32,6 @@ on:
     - cron: '0 0 * * 0'
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/build.yml'
-      - 'versions.json'
 
 permissions:
   contents: write
