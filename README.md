@@ -12,7 +12,6 @@ doesn't ship.
 | `ideviceinstaller.exe` | App install / list / uninstall (separate libimobiledevice subproject — jrjr omits this) |
 | `irecovery.exe` | DFU / recovery-mode boot-normal (libirecovery — jrjr omits this) |
 | `ideviceactivation.exe` | Apple-Configurator-style activation (libideviceactivation — jrjr omits this) |
-| `wdi-simple.exe` | libwdi CLI — binds WinUSB driver to iPhone in DFU mode |
 | All transitive DLLs | `libimobiledevice*.dll`, `libusbmuxd*.dll`, `libplist*.dll`, `libtatsu*.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`, `libcurl*.dll`, `libxml2*.dll`, `libzip*.dll`, zlib, etc. |
 
 ## Important: iTunes is required at runtime
@@ -46,7 +45,7 @@ Built weekly (Sunday 00:00 UTC) and on demand via `workflow_dispatch`.
 All upstream sources are pulled fresh from their master branches:
 `libplist`, `libimobiledevice-glue`, `libtatsu`, `libusbmuxd`,
 `libimobiledevice`, `libirecovery`, `ideviceinstaller`,
-`libideviceactivation`, [`pbatard/libwdi`](https://github.com/pbatard/libwdi).
+`libideviceactivation`.
 
 The exact commits used per build land in `VERSIONS.md` inside the zip.
 
@@ -74,8 +73,12 @@ At runtime, your app should:
 1. **Detect AMDS** at startup (probe `127.0.0.1:27015`) and surface a
    banner if missing. Do NOT attempt to spawn a competing daemon — none
    exists for Windows.
-2. **Run `wdi-simple.exe --vid 0x05ac --pid 0x1227 --type 0`** the first
-   time an iPhone is detected in DFU mode, to bind WinUSB.
+
+DFU-mode operations (`irecovery -n`) require a WinUSB driver bound to
+the iPhone's DFU-mode USB VID/PID (`0x05ac:0x1227`). This bundle does
+NOT ship libwdi for that — its build dependencies (WDK 8.x redist DLLs)
+proved too brittle for CI. Users hitting DFU should use iTunes' Restore
+button or install WinUSB via Zadig manually as the documented fallback.
 
 ## License notes
 
@@ -85,7 +88,6 @@ own license:
 | Project | License |
 |---|---|
 | libimobiledevice / libplist / libusbmuxd / libtatsu / libimobiledevice-glue / libirecovery / ideviceinstaller / libideviceactivation | LGPL-2.1 |
-| libwdi | LGPL-3.0 |
 
 LGPL allows redistribution in commercial closed-source apps provided you
 don't statically link and you include attribution. We dynamically link

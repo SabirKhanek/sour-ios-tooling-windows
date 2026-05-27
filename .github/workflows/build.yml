@@ -132,117 +132,22 @@ jobs:
             echo "::endgroup::"
           done
 
-      # ── Phase 2: libwdi (WinUSB driver installer for DFU mode) ──────────
-      #
-      # libwdi is what Zadig uses internally — Pete Batard's library for
-      # programmatically binding WinUSB to a USB device. iPhones in DFU
-      # mode present a different USB VID/PID than normal mode; even if iTunes
-      # is installed, DFU communication requires WinUSB driver binding.
-      #
-      # libwdi compiles cleanly under MSYS2/MinGW64 with autotools, BUT its
-      # configure script requires the Windows Driver Kit (WDK) — specifically
-      # the WinUSB co-installer DLLs (WinUsbCoInstaller2.dll) and WDF
-      # co-installer DLLs (WdfCoInstaller01011.dll). These are not part of
-      # the standard GitHub Actions Windows runner image.
-      #
-      # We install Windows Driver Kit 8.1 via chocolatey (preinstalled on the
-      # runner) before building libwdi, then point autogen.sh at the WDK
-      # install via --with-wdkdir. WDK 8.1's redist DLLs satisfy libwdi's
-      # WinUSB/WDF requirements; libwdi handles the version-detection.
-
-      - name: Locate Windows Driver Kit / SDK redistributables (for libwdi)
-        shell: pwsh
-        run: |
-          # libwdi needs WinUSB co-installer DLLs (WinUsbCoInstaller2.dll)
-          # and WDF co-installer DLLs (WdfCoInstaller01011.dll) embedded
-          # into wdi-simple.exe so it can install drivers on end-user
-          # machines that don't have a WDK.
-          #
-          # The chocolatey `windowsdriverkit81` package is dead. The
-          # next-best source: the Windows 10 SDK + WDK that comes
-          # preinstalled with Visual Studio 2022 on windows-latest runners,
-          # typically at C:\Program Files (x86)\Windows Kits\10\Redist.
-          #
-          # libwdi's --with-wdkdir option override the default WDK 8.x path
-          # detection. If WDK 10's redist layout differs from what libwdi
-          # expects, this step fails loudly and we drop libwdi (the rest
-          # of the bundle ships fine without it).
-
-          $candidates = @(
-            "C:\Program Files (x86)\Windows Kits\10",
-            "C:\Program Files (x86)\Windows Kits\8.1",
-            "C:\Program Files (x86)\Windows Kits\8.0"
-          )
-
-          $found = $null
-          foreach ($candidate in $candidates) {
-            if (Test-Path $candidate) {
-              Write-Host "Inspecting $candidate"
-              # Look for the actual coinstaller DLLs anywhere under the kit.
-              $winusb = Get-ChildItem -Path $candidate -Recurse -ErrorAction SilentlyContinue `
-                -Include "WinUsbCoInstaller2.dll" | Select-Object -First 1
-              $wdf = Get-ChildItem -Path $candidate -Recurse -ErrorAction SilentlyContinue `
-                -Include "WdfCoInstaller01011.dll" | Select-Object -First 1
-              if ($winusb -and $wdf) {
-                Write-Host "  ✓ WinUSB coinstaller: $($winusb.FullName)"
-                Write-Host "  ✓ WDF coinstaller:    $($wdf.FullName)"
-                $found = $candidate
-                break
-              } else {
-                Write-Host "  ⚠ kit exists but coinstaller DLLs not in expected layout"
-              }
-            }
-          }
-
-          if (-not $found) {
-            Write-Error @"
-          ✗ No Windows Driver Kit found on this runner with the WinUSB +
-            WDF coinstaller DLLs libwdi needs. Searched:
-              C:\Program Files (x86)\Windows Kits\{10, 8.1, 8.0}
-          Either:
-            1. Drop libwdi from this CI workflow (Windows DFU exit becomes a
-               documented limitation; users with stuck iPhones use iTunes'
-               Restore button instead).
-            2. Manually source WDK 8.0 / 8.1 redistributables (Microsoft's
-               archive download) and vendor them into this repo.
-          "@
-            exit 1
-          }
-
-          # Expose the discovered path to the next step.
-          echo "WDK_ROOT=$found" >> $env:GITHUB_ENV
-          Write-Host "✓ libwdi will use WDK at $found"
-
-      - name: Build libwdi (WinUSB driver setup for DFU)
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          PREFIX=/mingw64
-
-          # Translate the Windows-style WDK path (from previous step's
-          # $GITHUB_ENV) to MSYS2-style so libwdi's autoconf can grok it.
-          # `cygpath -u` handles the C:\... → /c/... conversion safely
-          # including the embedded space in "Program Files (x86)".
-          WDK_DIR=$(cygpath -u "$WDK_ROOT")
-          if [ ! -d "$WDK_DIR" ]; then
-            echo "✗ Translated WDK path doesn't exist: $WDK_DIR"
-            exit 1
-          fi
-
-          git clone --depth=1 https://github.com/pbatard/libwdi.git
-          pushd libwdi > /dev/null
-          ./autogen.sh \
-            --prefix=$PREFIX \
-            --enable-static \
-            --disable-shared \
-            --with-wdkdir="$WDK_DIR"
-          make -j$(nproc)
-          make install
-          # `wdi-simple` is the example CLI that ships with libwdi.
-          # It's what we'll invoke programmatically from the desktop app
-          # to bind WinUSB to the iPhone in DFU mode.
-          ls -la examples/wdi-simple.exe || ls -la examples/.libs/wdi-simple.exe
-          popd > /dev/null
+      # libwdi (WinUSB driver binding for iPhone DFU mode) was considered
+      # here but dropped. Reasons:
+      #   1. libwdi's configure requires WDK 8.0/8.1 redistributable DLLs
+      #      (WinUsbCoInstaller2.dll, WdfCoInstaller01011.dll). The
+      #      chocolatey `windowsdriverkit81` package is dead and the WDK 10
+      #      preinstalled on GitHub Actions windows-latest runners doesn't
+      #      ship the coinstaller redistributables Microsoft ships them
+      #      separately, license-fenced.
+      #   2. The only feature gated on libwdi is Windows DFU exit (a
+      #      recovery-from-mistake path, not a daily workflow). When users
+      #      hit a stuck iPhone, iTunes' Restore button is the documented
+      #      fallback.
+      # If/when a customer demands programmatic DFU exit on Windows, the
+      # cleanest path forward is to ship Zadig.exe (signed by Pete Batard,
+      # license-compliant) and trigger it from the desktop app on first
+      # DFU detection.
 
       # ── Phase 3: Smoke test each binary before packaging ───────────────
       #
@@ -337,14 +242,6 @@ jobs:
             -name "libstdc++-6.dll" \
           \) -exec cp -v {} out/ \;
 
-          # libwdi's CLI binary lives outside /mingw64/bin since we built
-          # it as static + the example tool is in the project tree.
-          if [ -f libwdi/examples/wdi-simple.exe ]; then
-            cp -v libwdi/examples/wdi-simple.exe out/
-          elif [ -f libwdi/examples/.libs/wdi-simple.exe ]; then
-            cp -v libwdi/examples/.libs/wdi-simple.exe out/
-          fi
-
           # Sanity check — count what we produced. Bail early if absurdly
           # low (catches misconfigured globs).
           count=$(find out/ -type f | wc -l)
@@ -367,7 +264,7 @@ jobs:
             echo
             echo "## Upstream commits"
             echo
-            for repo in libplist libimobiledevice-glue libtatsu libusbmuxd libimobiledevice libirecovery ideviceinstaller libideviceactivation libwdi; do
+            for repo in libplist libimobiledevice-glue libtatsu libusbmuxd libimobiledevice libirecovery ideviceinstaller libideviceactivation; do
               if [ -d "$repo/.git" ]; then
                 sha=$(git -C "$repo" rev-parse --short HEAD)
                 echo "- \`$repo\`: $sha"
@@ -405,20 +302,22 @@ jobs:
             ideviceinstaller.exe   — app install / list / uninstall
             irecovery.exe          — DFU/recovery boot-normal
             ideviceactivation.exe  — Apple-Configurator-style activation
-            wdi-simple.exe         — libwdi CLI; binds WinUSB to iPhone in DFU mode
 
           Usage:
             1. Extract this zip.
             2. Ensure iTunes is installed and "Apple Mobile Device Service"
                is running (Services.msc).
             3. All idevice* tools connect through AMDS to attached iPhones.
-            4. For DFU-mode operations, first run:
-                 wdi-simple.exe --vid 0x05ac --pid 0x1227 --type 0
-               (driver type 0 = WinUSB)
+
+          NOTE: irecovery's DFU-mode functions require a WinUSB driver bound
+          to the iPhone in DFU mode. We don't ship a driver installer (libwdi
+          was considered but its build dependencies were too brittle to
+          maintain in CI). For DFU operations on Windows, users can either
+          use iTunes' Restore button or install WinUSB via Zadig manually.
 
           See https://github.com/SabirKhanek/sour-ios-tooling-windows for
-          build instructions, license attribution (LGPL-2.1 + LGPL-3.0 for
-          libwdi), and source availability info.
+          build instructions, license attribution (LGPL-2.1), and source
+          availability info.
           EOF
 
       # ── Phase 5: Package + publish release ──────────────────────────────
